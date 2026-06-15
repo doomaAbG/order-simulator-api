@@ -1,25 +1,32 @@
 cmake_minimum_required(VERSION 3.15)
-project(OrderSimulator)
+project(OrderSimulator CXX)
 
-# Включаем стандарт C++20
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Ищем пакеты
+find_package(Boost REQUIRED COMPONENTS system)
+find_package(postgresql REQUIRED)
+find_package(Crow REQUIRED)
+find_package(RdKafka CONFIG REQUIRED) # <-- Добавили Кафку
 
-find_package(Crow CONFIG REQUIRED)
-find_package(Boost REQUIRED)
+find_package(pqxx CONFIG)
+if(NOT pqxx_FOUND)
+    find_package(libpqxx REQUIRED)
+endif()
 
-add_executable(order_api main.cpp)
+add_executable(OrderSimulator main.cpp)
 
-target_include_directories(order_api PRIVATE "C:/vcpkg/installed/x64-windows/include")
+if(TARGET pqxx::pqxx)
+    set(PQXX_LIBRARY pqxx::pqxx)
+else()
+    set(PQXX_LIBRARY libpqxx::pqxx)
+endif()
 
-
-target_link_libraries(order_api PRIVATE 
-    Crow::Crow 
-    Boost::boost 
-    "C:/vcpkg/installed/x64-windows/lib/pqxx.lib"
-    "C:/vcpkg/installed/x64-windows/lib/libpq.lib"
+# Линкуем всё вместе
+target_link_libraries(OrderSimulator PRIVATE 
+    Crow::Crow
+    ${PQXX_LIBRARY}
+    Boost::system
+    RdKafka::rdkafka++ # <-- Добавили C++ обертку Кафки
 )
-
-find_package(Threads REQUIRED)
-target_link_libraries(order_api PRIVATE Threads::Threads)

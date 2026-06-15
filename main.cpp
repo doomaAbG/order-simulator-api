@@ -1,247 +1,95 @@
-#define PQXX_SHARED 
-
 #include <crow.h>
 #include <pqxx/pqxx>
+#include <librdkafka/rdkafkacpp.h>
 #include <iostream>
 #include <string>
-#include <vector>
-#include <thread>
-#include <chrono>
-#include <windows.h> 
 
-d
-using namespace crow;
-
-void asyncOrderProcessor(std::string conn_str) {
-    while (true) {
-        try {
-            pqxx::connection c(conn_str);
-            pqxx::work tx(c);
-
-            // Ищем самый старый заказ со статусом PENDING
-            pqxx::result res = tx.exec_params(
-                "SELECT id FROM orders WHERE status = 'PENDING' ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
-            );
-
-            if (!res.empty()) {
-                int order_id = res[0]["id"].as<int>();
-                
-                
-                tx.exec_params("UPDATE orders SET status = 'PROCESSING' WHERE id = $1", order_id);
-                tx.commit();
-                
-                std::cout << "\n[Worker Thread] >>> Заказ #" << order_id << " принят в работу и отправлен на кухню!" << std::endl;
-
-                
-                std::this_thread::sleep_for(std::chrono::seconds(5));
-
-                
-                pqxx::work tx_complete(c);
-                tx_complete.exec_params("UPDATE orders SET status = 'COMPLETED' WHERE id = $1", order_id);
-                tx_complete.commit();
-                
-                std::cout << "[Worker Thread] <<< Заказ #" << order_id << " полностью ГОТОВ и выдан клиенту!\n" << std::endl;
-            } else {
-                tx.commit();
-            }
-        } 
-        catch (const std::exception& e) {
-            std::cerr << "[Worker Error] Ошибка в фоновом потоке: " << e.what() << std::endl;
-        }
-
-        
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-    }
-}
-
+const std::string CONN_STR = "host=127.0.0.1 port=5432 dbname=order_simulator user=postgres password=0000";
 
 int main() {
-    
-    SetConsoleOutputCP(65001); 
-    SetConsoleCP(65001);
-
     crow::SimpleApp app;
 
+    // --- НАСТРОЙКА KAFKA ---
+    std::string errstr;
+    RdKafka::Conf* conf = RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL);
     
-    std::string conn_str = "host=localhost port=5432 dbname=order_simulator user=postgres password=0000";
+    // Указываем адрес брокера (если Кафка в докере на этой же машине, то localhost:9092)
+    if (conf->set("bootstrap.servers", "localhost:9092", errstr) != RdKafka::Conf::CONF_OK) {
+        std::cerr << "Kafka Conf Error: " << errstr << std::endl;
+        return 1;
+    }
 
-    
-    CROW_ROUTE(app, "/")([](){
-        return "Welcome to the Order Simulator API (PostgreSQL Edition)!";
-    });
+    // Создаем продюсера
+    RdKafka::Producer* producer = RdKafka::Producer::create(conf, errstr);
+    if (!producer) {
+        std::cerr << "Failed to create Kafka producer: " << errstr << std::endl;
+        return 1;
+    }
+    delete conf; // Конфиг больше не нужен, можно удалить
+    // -----------------------
 
-    
-    CROW_ROUTE(app, "/products").methods("GET"_method)([&conn_str](){
-        crow::json::wvalue response;
+    CROW_ROUTE(app, "/orders").methods(crow::HTTPMethod::POST)([producer](const crow::request& req) {
         try {
-            pqxx::connection c(conn_str);
-            pqxx::work tx(c);
-            
-            pqxx::result res = tx.exec("SELECT id, name, price, stock FROM products ORDER BY id ASC");
-            
-            std::vector<crow::json::wvalue> products_list;
-            for (auto row : res) {
-                crow::json::wvalue prod;
-                prod["id"] = row["id"].as<int>();
-                prod["name"] = row["name"].as<std::string>();
-                prod["price"] = row["price"].as<double>();
-                prod["stock"] = row["stock"].as<int>();
-                products_list.push_back(prod);
-            }
-            
-            tx.commit();
-            return crow::response(200, crow::json::wvalue(products_list));
-        } 
-        catch (const std::exception& e) {
-            response["error"] = "Database error: " + std::string(e.what());
-            return crow::response(500, response);
-        }
-    });
-
-    
-    CROW_ROUTE(app, "/orders").methods("POST"_method)([&conn_str](const crow::request& req) {
-        auto x = crow::json::load(req.body);
-        crow::json::wvalue response;
-
-        if (!x || !x.has("product_id") || !x.has("quantity")) {
-            response["error"] = "Invalid JSON. Required: product_id, quantity";
-            return crow::response(400, response);
-        }
-
-        int product_id = x["product_id"].i();
-        int quantity = x["quantity"].i();
-
-        if (quantity <= 0) {
-            response["error"] = "Quantity must be greater than 0";
-            return crow::response(400, response);
-        }
-
-        try {
-            pqxx::connection c(conn_str);
-            pqxx::work tx(c);
-
-            pqxx::result res = tx.exec_params(
-                "SELECT price, stock FROM products WHERE id = $1 FOR UPDATE", product_id
-            );
-
-            if (res.empty()) {
-                response["error"] = "Product not found";
-                return crow::response(404, response);
+            auto json_data = crow::json::load(req.body);
+            if (!json_data) {
+                return crow::response(400, "Invalid JSON");
             }
 
-            double price = res[0]["price"].as<double>();
-            int current_stock = res[0]["stock"].as<int>();
+            int product_id = json_data["product_id"].i();
+            int quantity = json_data["quantity"].i();
+            double total_price = json_data["total_price"].d();
 
-            if (current_stock < quantity) {
-                response["error"] = "Not enough stock. Available: " + std::to_string(current_stock);
-                return crow::response(400, response);
-            }
+            // 1. Сохраняем в PostgreSQL
+            pqxx::connection conn(CONN_STR);
+            pqxx::work tx(conn);
 
-            double total_price = price * quantity;
+            std::string query = "INSERT INTO orders (product_id, quantity, total_price, status) VALUES (" 
+                                + std::to_string(product_id) + ", " 
+                                + std::to_string(quantity) + ", " 
+                                + std::to_string(total_price) + ", 'PENDING') RETURNING id";
 
-            
-            tx.exec_params("UPDATE products SET stock = stock - $1 WHERE id = $2", quantity, product_id);
-
-            
-            tx.exec_params(
-                "INSERT INTO orders (product_id, quantity, total_price, status) VALUES ($1, $2, $3, $4)",
-                product_id, quantity, total_price, "PENDING"
-            );
-
+            pqxx::result res = tx.exec(query);
+            int order_id = res[0][0].as<int>();
             tx.commit();
 
-            response["status"] = "Success";
-            response["message"] = "Order submitted! Processing in background...";
-            response["total_price"] = total_price;
+            // 2. Формируем сообщение для Кафки
+            std::string kafka_msg = "{\"order_id\":" + std::to_string(order_id) + 
+                                    ",\"status\":\"PENDING\",\"total_price\":" + std::to_string(total_price) + "}";
+
+            // 3. Публикуем в топик "order_topic"
+            RdKafka::ErrorCode resp = producer->produce(
+                "order_topic",             // Топик
+                RdKafka::Topic::PARTITION_UA, // Авто-выбор партиции
+                RdKafka::Producer::RK_MSG_COPY, // Копировать данные из строки
+                const_cast<char*>(kafka_msg.c_str()), kafka_msg.size(),
+                NULL, 0, 0, NULL, NULL
+            );
+
+            if (resp != RdKafka::ERR_NO_ERROR) {
+                std::cerr << "Kafka produce failed: " << RdKafka::err2str(resp) << std::endl;
+            } else {
+                std::cout << "Successfully sent order " << order_id << " to Kafka topic!" << std::endl;
+            }
+            
+            // Быстро проталкиваем буфер сообщений
+            producer->poll(0);
+
+            // Отвечаем клиенту
+            crow::json::wvalue response;
+            response["status"] = "Order submitted and sent to Kafka";
+            response["order_id"] = order_id;
+            
             return crow::response(201, response);
 
         } catch (const std::exception& e) {
-            response["error"] = "Database error: " + std::string(e.what());
-            return crow::response(500, response);
+            std::cerr << "Error: " << e.what() << std::endl;
+            return crow::response(500, "Internal Server Error");
         }
     });
 
+    app.port(8080).multithreaded().run();
 
-    CROW_ROUTE(app, "/orders-history").methods("GET"_method)([&conn_str](){
-        crow::json::wvalue response;
-        try {
-            pqxx::connection c(conn_str);
-            pqxx::work tx(c);
-            
-            std::string query = 
-                "SELECT o.id, p.name AS product_name, o.quantity, o.total_price, o.status "
-                "FROM orders o "
-                "INNER JOIN products p ON o.product_id = p.id "
-                "ORDER BY o.id DESC";
-                
-            pqxx::result res = tx.exec(query);
-            
-            std::vector<crow::json::wvalue> orders_list;
-            for (auto row : res) {
-                crow::json::wvalue ord;
-                ord["order_id"] = row["id"].as<int>();
-                ord["product_name"] = row["product_name"].as<std::string>();
-                ord["quantity"] = row["quantity"].as<int>();
-                ord["total_price"] = row["total_price"].as<double>();
-                ord["status"] = row["status"].as<std::string>();
-                orders_list.push_back(ord);
-            }
-            
-            tx.commit();
-            return crow::response(200, crow::json::wvalue(orders_list));
-        } 
-        catch (const std::exception& e) {
-            response["error"] = "Database error: " + std::string(e.what());
-            return crow::response(500, response);
-        }
-    });
-
-   
-    CROW_ROUTE(app, "/orders/status").methods("PATCH"_method)([&conn_str](const crow::request& req) {
-        auto x = crow::json::load(req.body);
-        crow::json::wvalue response;
-
-        if (!x || !x.has("order_id") || !x.has("status")) {
-            response["error"] = "Invalid JSON. Required: order_id, status";
-            return crow::response(400, response);
-        }
-
-        int order_id = x["order_id"].i();
-        std::string new_status = x["status"].s();
-
-        if (new_status != "PENDING" && new_status != "PROCESSING" && new_status != "COMPLETED" && new_status != "CANCELLED") {
-            response["error"] = "Invalid status. Choose from: PENDING, PROCESSING, COMPLETED, CANCELLED";
-            return crow::response(400, response);
-        }
-
-        try {
-            pqxx::connection c(conn_str);
-            pqxx::work tx(c);
-
-            pqxx::result check_res = tx.exec_params("SELECT id FROM orders WHERE id = $1", order_id);
-            if (check_res.empty()) {
-                response["error"] = "Order not found";
-                return crow::response(404, response);
-            }
-
-            tx.exec_params("UPDATE orders SET status = $1 WHERE id = $2", new_status, order_id);
-            tx.commit();
-
-            response["status"] = "Success";
-            response["message"] = "Order status updated manually to " + new_status;
-            return crow::response(200, response);
-
-        } catch (const std::exception& e) {
-            response["error"] = "Database error: " + std::string(e.what());
-            return crow::response(500, response);
-        }
-    });
-
-    std::thread worker(asyncOrderProcessor, conn_str);
-    worker.detach(); 
-
-    std::cout << "Order Simulator with Async Multithreading Worker is running on port 18080..." << std::endl;
-    
-
-    app.port(18080).multithreaded().run();
+    // Очистка ресурсов перед выходом
+    delete producer;
+    return 0;
 }
