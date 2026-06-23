@@ -15,7 +15,18 @@ if(NOT pqxx_FOUND)
     find_package(libpqxx REQUIRED)
 endif()
 
-add_executable(OrderSimulator main.cpp)
+# Ищем все файлы .cpp и .hpp в папке src и корне
+file(GLOB_RECURSE SOURCES 
+    "main.cpp"
+    "src/*.cpp"
+    "src/*.hpp"
+)
+
+# Собираем бинарник из всех найденных файлов
+add_executable(OrderSimulator ${SOURCES})
+
+# Говорим компилятору, что папка src доступна для подключений #include
+target_include_directories(OrderSimulator PRIVATE src)
 
 if(TARGET pqxx::pqxx)
     set(PQXX_LIBRARY pqxx::pqxx)
